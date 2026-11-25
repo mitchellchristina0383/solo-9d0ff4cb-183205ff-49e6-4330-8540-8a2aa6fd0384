@@ -27,8 +27,8 @@ CREATE INDEX IF NOT EXISTS idx_alerts_ts_id ON alerts(timestamp DESC, id DESC);
 """
 
 
-def db_path(shard_id: int) -> str:
-    return os.path.join(settings.db_dir, f"shard_{shard_id}.db")
+def db_path(shard_id: int, db_dir: str | None = None) -> str:
+    return os.path.join(db_dir or settings.db_dir, f"shard_{shard_id}.db")
 
 
 def _connect(path: str) -> sqlite3.Connection:
@@ -40,12 +40,24 @@ def _connect(path: str) -> sqlite3.Connection:
     return conn
 
 
+def _connect_read(path: str) -> sqlite3.Connection:
+    """短命只读连接：不做 PRAGMA journal_mode=WAL 这类可能受写锁影响的设置。
+
+    用于录入前的全局查重。WAL 模式下读不会被正在等写锁的连接挡住，
+    因此某个分片的写入排队时，其它分片仍可查重并录入不同编号。
+    """
+    conn = sqlite3.connect(path, timeout=5, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
 class Shard:
     """一个分片的句柄；写入走长连接 + 异步锁（见 main 中的锁）。"""
 
-    def __init__(self, shard_id: int) -> None:
+    def __init__(self, shard_id: int, db_dir: str | None = None) -> None:
         self.shard_id = shard_id
-        self.path = db_path(shard_id)
+        self.path = db_path(shard_id, db_dir)
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self._write_conn = _connect(self.path)
         self._write_conn.executescript(SCHEMA)
@@ -58,6 +70,17 @@ class Shard:
             (alert_id, timestamp, level, source, message),
         )
         self._write_conn.commit()
+
+    def contains(self, alert_id: str) -> bool:
+        """该分片的已提交数据里是否已有此编号。"""
+        conn = _connect_read(self.path)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM alerts WHERE id = ? LIMIT 1", (alert_id,)
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
 
     def open_snapshot(self) -> "ShardSnapshot":
         return ShardSnapshot(self.shard_id, self.path)
